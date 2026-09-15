@@ -43,13 +43,12 @@ def evaluate_position(fen, depth=18, multipv=5):
             score = info["score"].pov(board.turn)
 
             top_moves.append(
-
-           {
-             "move": board.san(info["pv"][0]),
-             "evaluation": score_to_float(score),
-             "principal_variation": board.variation_san(info["pv"]),
-           }
-          )
+          {
+            "move": board.san(info["pv"][0]),
+            "evaluation": score_to_float(score),
+            "pv": board.variation_san(info["pv"]),
+          }
+)
 
         best = top_moves[0]
 
@@ -64,7 +63,69 @@ def evaluate_position(fen, depth=18, multipv=5):
     finally:
         engine.quit()
 
+def evaluate_specific_move(fen, move_uci, depth=18):
+    """
+    Evaluate a specific candidate move with Stockfish.
 
+    Maia chooses the move.
+    Stockfish evaluates the resulting position and provides
+    the continuation.
+
+    The returned evaluation is from the perspective of the
+    player who made move_uci.
+    """
+
+    board = chess.Board(fen)
+    original_turn = board.turn
+
+    try:
+        move = chess.Move.from_uci(move_uci)
+
+        if move not in board.legal_moves:
+            raise ValueError(f"Illegal move: {move_uci}")
+
+        move_san = board.san(move)
+
+        # Make the Maia-selected move.
+        board.push(move)
+
+        engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+
+        try:
+            info = engine.analyse(
+                board,
+                chess.engine.Limit(depth=depth),
+            )
+
+            # Convert Stockfish's score back to the player
+            # who made the Maia move.
+            score = info["score"].pov(original_turn)
+
+            continuation = info.get("pv", [])
+
+            # Convert the continuation to SAN.
+            variation_board = board.copy()
+            variation_san = []
+
+            for pv_move in continuation:
+                variation_san.append(variation_board.san(pv_move))
+                variation_board.push(pv_move)
+
+            # Full line starts with Maia's move.
+            full_variation = [move_san] + variation_san
+
+            return {
+                "move": move_san,
+                "uci": move_uci,
+                "evaluation": score_to_float(score),
+                "pv": full_variation,
+            }
+
+        finally:
+            engine.quit()
+
+    except chess.IllegalMoveError:
+        raise ValueError(f"Illegal move: {move_uci}")
 def score_to_float(score):
     """
     Convert Stockfish's score into a human-readable float.
@@ -116,7 +177,7 @@ def main():
             print(f"\n{i}. {move['move']}")
             print(f"   Evaluation: {move['evaluation']:+.2f}")
             print("   Principal Variation:")
-            print(f"   {move['principal_variation']}")
+            print(f"   {move["pv"]}")
 
         print("\n" + "=" * 60)
 
