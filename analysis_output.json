@@ -1,0 +1,103 @@
+{
+  "game": {
+    "white": "pranav-thechessguy",
+    "black": "Fatima",
+    "white_elo": "1917",
+    "black_elo": "2000",
+    "result": "0-1",
+    "event": "Play vs Bot",
+    "date": "2026.09.15"
+  },
+  "settings": {
+    "player_elo": 1900,
+    "opponent_elo": 2100,
+    "stockfish_depth": 18,
+    "multipv": 5,
+    "maia_model": "Maia3-79M",
+    "annotation_model": "gemini-3.6-flash"
+  },
+  "anomalies": [
+    {
+      "ply": 9,
+      "move_number": 5,
+      "player": "white",
+      "move": "Ng5",
+      "fen_before": "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQK2R w KQkq - 1 5",
+      "fen_after": "r1bqk2r/pppp1ppp/2n2n2/2b1p1N1/2B1P3/3P4/PPP2PPP/RNBQK2R b KQkq - 2 5",
+      "fen": "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQK2R w KQkq - 1 5",
+      "played_move": "Ng5",
+      "player_elo": 1900,
+      "anomaly_reasons": [
+        "Stockfish classified the move as inaccuracy.",
+        "The played move was outside Maia's top 5 human predictions."
+      ],
+      "stockfish": {
+        "best_move": "c3",
+        "position_evaluation": 0.23,
+        "played_move_evaluation": -0.46,
+        "evaluation_loss": 0.6900000000000001,
+        "classification": "inaccuracy"
+      },
+      "maia": {
+        "best_human_move": "O-O",
+        "played_move_rank": null,
+        "classification": "unexpected"
+      },
+      "annotation": "Launching an early attack with 5. Ng5 is an eager attempt to target f7, but here it proves premature and questionable. With the pawn already committed to d3, Black can easily neutralize the threat, whereas solid choices like preparing the center with 5. c3 or simply castling (5. O-O) keep White in control. As a practical lesson, avoid initiating single-piece attacks before completing your basic development unless the tactical circumstances strictly demand it."
+    },
+    {
+      "ply": 10,
+      "move_number": 5,
+      "player": "black",
+      "move": "d5",
+      "fen_before": "r1bqk2r/pppp1ppp/2n2n2/2b1p1N1/2B1P3/3P4/PPP2PPP/RNBQK2R b KQkq - 2 5",
+      "fen_after": "r1bqk2r/ppp2ppp/2n2n2/2bpp1N1/2B1P3/3P4/PPP2PPP/RNBQK2R w KQkq - 0 6",
+      "fen": "r1bqk2r/pppp1ppp/2n2n2/2b1p1N1/2B1P3/3P4/PPP2PPP/RNBQK2R b KQkq - 2 5",
+      "played_move": "d5",
+      "player_elo": 1900,
+      "anomaly_reasons": [
+        "Stockfish classified the move as mistake."
+      ],
+      "stockfish": {
+        "best_move": "O-O",
+        "position_evaluation": 0.57,
+        "played_move_evaluation": -0.26,
+        "evaluation_loss": 0.83,
+        "classification": "mistake"
+      },
+      "maia": {
+        "best_human_move": "O-O",
+        "played_move_rank": 2,
+        "classification": "natural_alternative"
+      },
+      "annotation": "Striking back in the center with 5...d5 is a very natural reaction to White's pressure on f7, but in this specific setup, it turns out to be a mistake. Opening the center prematurely while your king remains uncastled allows White to gain the upper hand. Simply castling with 5...O-O was the stronger path, completing your development and neutralizing White's early knight advance. **Practical Lesson:** Before committing to a central pawn break under pressure, check if a simple developing move like castling diffuses the opponent's threat more effectively."
+    },
+    {
+      "ply": 12,
+      "move_number": 6,
+      "player": "black",
+      "move": "b5",
+      "fen_before": "r1bqk2r/ppp2ppp/2n2n2/2bPp1N1/2B5/3P4/PPP2PPP/RNBQK2R b KQkq - 0 6",
+      "fen_after": "r1bqk2r/p1p2ppp/2n2n2/1pbPp1N1/2B5/3P4/PPP2PPP/RNBQK2R w KQkq - 0 7",
+      "fen": "r1bqk2r/ppp2ppp/2n2n2/2bPp1N1/2B5/3P4/PPP2PPP/RNBQK2R b KQkq - 0 6",
+      "played_move": "b5",
+      "player_elo": 1900,
+      "anomaly_reasons": [
+        "Stockfish classified the move as inaccuracy."
+      ],
+      "stockfish": {
+        "best_move": "b5",
+        "position_evaluation": -0.36,
+        "played_move_evaluation": -0.66,
+        "evaluation_loss": 0.30000000000000004,
+        "classification": "inaccuracy"
+      },
+      "maia": {
+        "best_human_move": "Nxd5",
+        "played_move_rank": 5,
+        "classification": "natural_alternative"
+      },
+      "annotation": "Counter-striking on the flank with 6...b5 is a sharp and ambitious idea, but it proves to be a slight inaccuracy here. Simply recapturing in the center with 6...Nxd5 is the most natural and effective path, liquidating White's advanced pawn while keeping your forces coordinated. \n\n**Practical Lesson:** Before committing to aggressive flank counter-thrusts, make sure straightforward central recaptures aren't already giving you a comfortable game."
+    }
+  ]
+}

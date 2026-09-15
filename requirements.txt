@@ -1,3 +1,4 @@
 python-chess
 fastapi
 uvicorn
+google-genai
