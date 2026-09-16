@@ -1,194 +1,438 @@
+from __future__ import annotations
+
 import json
 import os
-import re
 from typing import Any
 
-from google import genai
+from openai import OpenAI
 
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# =========================================================
+# Configuration
+# =========================================================
 
+MODEL = "gpt-5.6-luna"
+MAX_OUTPUT_TOKENS = 4000
+
+
+# =========================================================
+# OpenAI client
+# =========================================================
+
+_api_key = os.getenv("OPENAI_API_KEY")
+
+if not _api_key:
+    raise RuntimeError(
+        "OPENAI_API_KEY environment variable is not set."
+    )
+
+client = OpenAI(api_key=_api_key)
+
+
+# =========================================================
+# System prompt
+# =========================================================
 
 SYSTEM_PROMPT = """
-You are a human chess coach.
+You are a strong, friendly chess coach.
 
-Your job is to explain only the chess anomalies identified by the supplied analysis.
-Use the objective chess calculation evidence as factual evidence and the human-likelihood evidence as context about how natural or unusual the move is for the stated Elo.
+Your job is to explain specific moves from a real chess game using BOTH
+objective chess analysis and human-move analysis.
 
-Rules:
-- Do not mention Stockfish, Maia, Gemini, engines, models, scores, ranks, MultiPV, centipawns, or WDL in the coaching text.
-- Do not invent tactics, threats, variations, or positions that are not supported by the supplied board state and evidence.
-- Explain the practical chess idea a player at the stated level should understand.
-- Be specific about what the played move did and what kind of improvement would make sense when the evidence supports it.
-- Keep each annotation to 2-5 sentences.
-- No Markdown, headings, bullets, or numbering inside an annotation.
-""".strip()
+You will receive:
 
+1. Stockfish evidence
+   - Use this to understand the objective chess quality of the played move.
+   - Use it to explain concrete tactical, positional, or strategic consequences.
+   - A supplied best move may be mentioned when it is useful and verified by the
+     supplied evidence.
 
-def get_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+2. Maia evidence
+   - Use this to understand what a human player around the supplied Elo would
+     naturally consider.
+   - Maia's top_moves are human-like candidate moves.
+   - When useful, naturally mention one of those human-like alternatives in the
+     coaching explanation.
 
-    return genai.Client(api_key=api_key)
+IMPORTANT:
 
+- Never mention Stockfish.
+- Never mention Maia.
+- Never mention engines or models.
+- Never mention evaluation scores.
+- Never mention engine rankings.
+- Never mention predicted Elo.
+- Never mention internal classifications such as "blunder", "mistake",
+  "inaccuracy", "unexpected", "natural", or "most_natural".
+- Do not expose probabilities or ranks.
+- Do not invent a move, square, piece, tactic, or variation.
+- Only use moves and chess ideas supported by the supplied data.
+- Do not contradict the supplied evidence.
+- Do not automatically suggest an alternative unless the supplied evidence
+  contains that move.
+- Prefer a human-like alternative from the supplied Maia top_moves when such
+  an alternative helps the explanation.
+- Prefer the supplied objective best move when explaining what would have been
+  objectively stronger.
+- If both Maia and Stockfish provide useful alternatives, combine them naturally
+  rather than listing them mechanically.
+- Explain what happened and what the player can learn.
+- Focus on the specific move and position.
+- Do not give generic praise or criticism.
 
-def build_prompt(move_data: dict[str, Any]) -> str:
-    return json.dumps(move_data, ensure_ascii=False, indent=2)
+Write exactly 2–4 natural sentences per annotation.
 
+Sound like a human chess coach reviewing the player's game.
 
-def _extract_json(text: str) -> Any:
-    """Parse JSON even when the model wraps it in a Markdown code fence."""
-    text = (text or "").strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    fenced = re.search(
-        r"```(?:json)?\s*(.*?)\s*```",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if fenced:
-        return json.loads(fenced.group(1))
-
-    array_start = text.find("[")
-    array_end = text.rfind("]")
-    if array_start != -1 and array_end > array_start:
-        return json.loads(text[array_start:array_end + 1])
-
-    object_start = text.find("{")
-    object_end = text.rfind("}")
-    if object_start != -1 and object_end > object_start:
-        return json.loads(text[object_start:object_end + 1])
-
-    raise ValueError("Gemini response did not contain valid JSON")
+Do not use headings, bullets, labels, metadata, or JSON inside each comment.
+Return only the requested structured JSON.
+"""
 
 
-def generate_annotation(move_data: dict[str, Any]) -> str:
-    """
-    Backwards-compatible single-item annotation helper.
-    The main pipeline uses generate_annotations_batch().
-    """
-    client = get_client()
+# =========================================================
+# Structured output schema
+# =========================================================
 
-    prompt = """
-Return one coaching annotation for the supplied chess anomaly.
-Return ONLY the annotation text, with no Markdown and no JSON.
-
-ANOMALY:
-""" + build_prompt(move_data)
-
-    response = client.interactions.create(
-        model=MODEL,
-        system_instruction=SYSTEM_PROMPT,
-        input=prompt,
-    )
-
-    annotation = (response.output_text or "").strip()
-    if not annotation:
-        raise RuntimeError("Gemini returned an empty annotation")
-
-    return annotation
+ANNOTATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "annotations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "ply": {"type": "integer"},
+                    "comment": {"type": "string"},
+                },
+                "required": ["ply", "comment"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["annotations"],
+    "additionalProperties": False,
+}
 
 
-def generate_annotations_batch(move_data_list: list[dict[str, Any]]) -> dict[int, str]:
-    """
-    Generate all anomaly annotations in ONE Gemini request.
+# =========================================================
+# Helpers
+# =========================================================
 
-    Returns:
-        {ply: annotation_text}
-    """
-    if not move_data_list:
-        return {}
+def _safe_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    return {}
 
-    client = get_client()
 
-    payload = {
-        "tasks": [
+def _clean_comment(comment: Any) -> str:
+    if comment is None:
+        return ""
+
+    text = str(comment).strip()
+
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1].strip()
+
+    return text
+
+
+def _move_summary(move: dict) -> str:
+    parts = []
+
+    if move.get("rank") is not None:
+        parts.append(f"rank={move.get('rank')}")
+
+    if move.get("uci"):
+        parts.append(f"uci={move.get('uci')}")
+
+    if move.get("move"):
+        parts.append(f"move={move.get('move')}")
+
+    if move.get("evaluation") is not None:
+        parts.append(f"evaluation={move.get('evaluation')}")
+
+    return ", ".join(parts)
+
+
+# =========================================================
+# Build annotation input
+# =========================================================
+
+def build_annotation_input(
+    candidate: dict,
+    player_elo: int,
+    opponent_elo: int,
+) -> dict:
+    """Build the complete evidence package sent to OpenAI."""
+
+    move_data = _safe_dict(candidate.get("move"))
+    stockfish = _safe_dict(candidate.get("stockfish"))
+    maia = _safe_dict(candidate.get("maia"))
+
+    stockfish_top_moves = stockfish.get("top_moves", [])
+    maia_top_moves = maia.get("top_moves", [])
+
+    compact_stockfish_moves = []
+    for move in stockfish_top_moves:
+        move = _safe_dict(move)
+        compact_stockfish_moves.append(
             {
-                "ply": item["ply"],
-                "move": item["move"],
-                "fen_before": item.get("fen_before"),
-                "fen_after": item.get("fen_after"),
-                "uci": item.get("uci"),
-                "move_number": item.get("move_number"),
-                "player": item.get("player"),
-                "player_elo": item.get("player_elo"),
-                "opponent_elo": item.get("opponent_elo"),
-                "anomaly_reasons": item.get("anomaly_reasons", []),
-                "stockfish": item.get("stockfish", {}),
-                "maia": item.get("maia", {}),
-                "stockfish_anomaly": item.get("stockfish_anomaly", False),
-                "maia_anomaly": item.get("maia_anomaly", False),
+                "rank": move.get("rank"),
+                "uci": move.get("uci"),
+                "move": move.get("move"),
+                "evaluation": move.get("evaluation"),
             }
-            for item in move_data_list
-        ]
+        )
+
+    compact_maia_moves = []
+    for move in maia_top_moves:
+        move = _safe_dict(move)
+        compact_maia_moves.append(
+            {
+                "rank": move.get("rank"),
+                "uci": move.get("uci"),
+                "move": move.get("move"),
+            }
+        )
+
+    return {
+        "ply": move_data.get("ply"),
+        "move_number": move_data.get("move_number"),
+        "player": move_data.get("player"),
+        "move": move_data.get("move"),
+        "uci": move_data.get("uci"),
+        "fen_before": move_data.get("fen_before"),
+        "fen_after": move_data.get("fen_after"),
+        "player_elo": player_elo,
+        "opponent_elo": opponent_elo,
+        "stockfish": {
+            "classification": stockfish.get("classification"),
+            "best_move": stockfish.get("best_move"),
+            "best_evaluation": stockfish.get("best_evaluation"),
+            "played_evaluation": stockfish.get("played_evaluation"),
+            "evaluation_loss": stockfish.get("evaluation_loss"),
+            "gap_to_second": stockfish.get("gap_to_second"),
+            "top_moves": compact_stockfish_moves,
+        },
+        "maia": {
+            "classification": maia.get("classification"),
+            "rank": maia.get("rank"),
+            "best_move": maia.get("best_move"),
+            "elo": maia.get("elo"),
+            "self_elo": maia.get("self_elo"),
+            "oppo_elo": maia.get("oppo_elo"),
+            "top_moves": compact_maia_moves,
+        },
+        "stockfish_anomaly": candidate.get("stockfish_anomaly"),
+        "maia_anomaly": candidate.get("maia_anomaly"),
     }
 
-    prompt = """
-Generate one coaching annotation for EVERY task below.
 
-Return ONLY a JSON array.
-The array must contain exactly one object for every task, in the same order.
-Each object must have exactly these fields:
-{"ply": <integer>, "annotation": "<2-5 sentence coaching annotation>"}
+# =========================================================
+# Build batch prompt
+# =========================================================
 
-Do not omit tasks.
-Do not add commentary before or after the JSON array.
+def _build_batch_prompt(annotation_inputs: list[dict]) -> str:
+    blocks = []
 
-TASKS:
-""" + json.dumps(payload, ensure_ascii=False, indent=2)
+    for item in annotation_inputs:
+        stockfish = _safe_dict(item.get("stockfish"))
+        maia = _safe_dict(item.get("maia"))
 
-    response = client.interactions.create(
-        model=MODEL,
-        system_instruction=SYSTEM_PROMPT,
-        input=prompt,
+        sf_alternatives = []
+        for sf_move in stockfish.get("top_moves", []):
+            summary = _move_summary(_safe_dict(sf_move))
+            if summary:
+                sf_alternatives.append(summary)
+
+        maia_alternatives = []
+        for maia_move in maia.get("top_moves", []):
+            summary = _move_summary(_safe_dict(maia_move))
+            if summary:
+                maia_alternatives.append(summary)
+
+        block = {
+            "ply": item.get("ply"),
+            "move_number": item.get("move_number"),
+            "player": item.get("player"),
+            "played_move": item.get("move"),
+            "uci": item.get("uci"),
+            "fen_before": item.get("fen_before"),
+            "fen_after": item.get("fen_after"),
+            "player_elo": item.get("player_elo"),
+            "opponent_elo": item.get("opponent_elo"),
+            "stockfish": {
+                "classification": stockfish.get("classification"),
+                "best_move": stockfish.get("best_move"),
+                "best_evaluation": stockfish.get("best_evaluation"),
+                "played_evaluation": stockfish.get("played_evaluation"),
+                "evaluation_loss": stockfish.get("evaluation_loss"),
+                "gap_to_second": stockfish.get("gap_to_second"),
+                "top_moves": sf_alternatives,
+            },
+            "maia": {
+                "classification": maia.get("classification"),
+                "best_move": maia.get("best_move"),
+                "human_likely_moves": maia_alternatives,
+            },
+            "stockfish_anomaly": item.get("stockfish_anomaly"),
+            "maia_anomaly": item.get("maia_anomaly"),
+        }
+
+        blocks.append(
+            json.dumps(block, ensure_ascii=False, indent=2)
+        )
+
+    return (
+        "Analyze the following chess moves.\n\n"
+        "For EACH candidate, use BOTH the objective chess evidence "
+        "and the human-move evidence.\n\n"
+        "The Stockfish section describes objective chess quality.\n"
+        "The Maia section describes moves a human around the configured Elo "
+        "would naturally consider.\n\n"
+        "When appropriate, make the coaching explanation include a natural "
+        "human-level alternative from Maia's supplied human_likely_moves.\n\n"
+        "Do not mention the names of the systems or any internal labels in the comments.\n\n"
+        "Return exactly one annotation for every supplied ply.\n\n"
+        "CANDIDATES:\n\n"
+        + "\n\n--- CANDIDATE ---\n\n".join(blocks)
     )
 
-    raw = (response.output_text or "").strip()
-    if not raw:
-        raise RuntimeError("Gemini returned an empty batch response")
 
-    parsed = _extract_json(raw)
+# =========================================================
+# Batch annotation generation
+# =========================================================
 
-    if isinstance(parsed, dict):
-        parsed = parsed.get("annotations")
+def generate_annotations_batch(annotation_inputs: list[dict]) -> dict[int, str]:
+    """Generate all coaching annotations in one OpenAI request."""
 
-    if not isinstance(parsed, list):
-        raise ValueError("Gemini batch response must be a JSON array")
+    if not annotation_inputs:
+        return {}
 
-    expected_plies = [int(item["ply"]) for item in move_data_list]
+    prompt = _build_batch_prompt(annotation_inputs)
+
+    print(
+        f"Generating {len(annotation_inputs)} coaching annotations "
+        "with OpenAI in one request..."
+    )
+
+    response = client.responses.create(
+        model=MODEL,
+        instructions=SYSTEM_PROMPT,
+        input=prompt,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        reasoning={"effort": "none"},
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "chess_annotations",
+                "strict": True,
+                "schema": ANNOTATION_SCHEMA,
+            }
+        },
+    )
+
+    output_text = getattr(response, "output_text", None)
+
+    if not output_text:
+        raise RuntimeError("OpenAI returned no output_text.")
+
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("OpenAI returned invalid JSON.") from exc
+
+    raw_annotations = parsed.get("annotations")
+    if not isinstance(raw_annotations, list):
+        raise RuntimeError(
+            "OpenAI response does not contain an annotations array."
+        )
+
     annotations_by_ply: dict[int, str] = {}
 
-    for item in parsed:
+    for item in raw_annotations:
         if not isinstance(item, dict):
-            raise ValueError("Gemini batch response contains a non-object item")
+            continue
 
-        if "ply" not in item or "annotation" not in item:
-            raise ValueError("Gemini batch item is missing ply or annotation")
+        ply = item.get("ply")
+        comment = _clean_comment(item.get("comment"))
 
-        ply = int(item["ply"])
-        annotation = str(item["annotation"]).strip()
+        if not isinstance(ply, int):
+            continue
 
-        if not annotation:
-            raise ValueError(f"Empty Gemini annotation for ply {ply}")
+        if not comment:
+            continue
 
-        annotations_by_ply[ply] = annotation
+        annotations_by_ply[ply] = comment
 
-    missing = [ply for ply in expected_plies if ply not in annotations_by_ply]
-    extra = [ply for ply in annotations_by_ply if ply not in expected_plies]
+    expected_plies = {
+        item.get("ply")
+        for item in annotation_inputs
+        if isinstance(item.get("ply"), int)
+    }
+
+    actual_plies = set(annotations_by_ply.keys())
+    missing = expected_plies - actual_plies
+    extras = actual_plies - expected_plies
+
+    if extras:
+        print(
+            "Warning: OpenAI returned unexpected plies: "
+            f"{sorted(extras)}"
+        )
 
     if missing:
-        raise ValueError(
-            f"Gemini batch response is missing annotations for plies: {missing}"
+        print(
+            "Warning: OpenAI did not return annotations for plies: "
+            f"{sorted(missing)}"
         )
 
-    if extra:
-        raise ValueError(
-            f"Gemini batch response returned unexpected plies: {extra}"
-        )
+    print(
+        f"OpenAI generated {len(annotations_by_ply)} of "
+        f"{len(expected_plies)} annotations in one request."
+    )
 
     return annotations_by_ply
+
+
+# =========================================================
+# Single annotation compatibility wrapper
+# =========================================================
+
+def generate_annotation(
+    annotation_input: dict | None = None,
+    *,
+    move: str | None = None,
+    fen: str | None = None,
+    played_move: str | None = None,
+    stockfish: dict | None = None,
+    maia: dict | None = None,
+    player_elo: int | None = None,
+    opponent_elo: int | None = None,
+) -> str:
+    """Compatibility wrapper for older calling code."""
+
+    if annotation_input is None:
+        annotation_input = {
+            "ply": 1,
+            "move": move,
+            "uci": played_move,
+            "fen_before": fen,
+            "player_elo": player_elo,
+            "opponent_elo": opponent_elo,
+            "stockfish": stockfish or {},
+            "maia": maia or {},
+            "stockfish_anomaly": True,
+            "maia_anomaly": False,
+        }
+
+    annotations = generate_annotations_batch([annotation_input])
+    ply = annotation_input.get("ply")
+
+    if ply in annotations:
+        return annotations[ply]
+
+    raise RuntimeError(
+        f"OpenAI did not return an annotation for ply {ply}."
+    )
+

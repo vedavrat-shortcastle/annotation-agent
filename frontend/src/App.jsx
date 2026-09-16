@@ -7,6 +7,8 @@ function App() {
   const [opponentElo, setOpponentElo] = useState(2100);
 
   const [result, setResult] = useState(null);
+  const [annotatedPgn, setAnnotatedPgn] = useState("");
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -19,6 +21,7 @@ function App() {
     setLoading(true);
     setError("");
     setResult(null);
+    setAnnotatedPgn("");
 
     try {
       const data = await analyzeGame({
@@ -27,184 +30,293 @@ function App() {
         opponent_elo: opponentElo,
       });
 
-      console.log("Analysis response:", data);
-
       setResult(data);
+      setAnnotatedPgn(data.annotated_pgn || "");
     } catch (err) {
-      console.error(err);
-      setError(err.message || "Analysis failed.");
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Game analysis failed."
+      );
     } finally {
       setLoading(false);
     }
   }
 
+  function downloadAnnotatedPgn() {
+    if (!annotatedPgn) return;
+
+    const blob = new Blob(
+      [annotatedPgn],
+      {
+        type: "application/x-chess-pgn;charset=utf-8",
+      }
+    );
+
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "annotated_game.pgn";
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    URL.revokeObjectURL(url);
+  }
+
+  function formatPlayerName(name, fallback) {
+    return name && name !== "?" ? name : fallback;
+  }
+
   return (
     <div className="app">
+      {/* =====================================================
+          Header
+          ===================================================== */}
       <header className="header">
-        <h1>Annotation Agent</h1>
-        <p>
-          Personalized chess analysis using
-          Stockfish, Maia-3 and an AI coach.
-        </p>
+        <div>
+          <div className="eyebrow">SHORTCASTLE</div>
+          <h1>Chess Annotation Agent</h1>
+          <p>
+            Personalized chess coaching from your own game.
+          </p>
+        </div>
       </header>
 
-      <main className="container">
-        <section className="card">
-          <h2>Analyze Game</h2>
+      <main className="main">
+        {/* =================================================
+            Input section
+            ================================================= */}
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <h2>Analyze a game</h2>
+              <p>
+                Paste a complete PGN and add the player ratings.
+              </p>
+            </div>
+          </div>
 
           <div className="elo-row">
-            <div>
-              <label>Player Elo</label>
+            <div className="field">
+              <label htmlFor="player-elo">
+                Player Elo
+              </label>
+
               <input
+                id="player-elo"
                 type="number"
+                min="1"
                 value={playerElo}
-                onChange={(e) =>
-                  setPlayerElo(e.target.value)
+                onChange={(event) =>
+                  setPlayerElo(event.target.value)
                 }
               />
             </div>
 
-            <div>
-              <label>Opponent Elo</label>
+            <div className="field">
+              <label htmlFor="opponent-elo">
+                Opponent Elo
+              </label>
+
               <input
+                id="opponent-elo"
                 type="number"
+                min="1"
                 value={opponentElo}
-                onChange={(e) =>
-                  setOpponentElo(e.target.value)
+                onChange={(event) =>
+                  setOpponentElo(event.target.value)
                 }
               />
             </div>
           </div>
 
-          <label>PGN</label>
+          <div className="field">
+            <label htmlFor="pgn">
+              PGN
+            </label>
 
-          <textarea
-            value={pgn}
-            onChange={(e) => setPgn(e.target.value)}
-            placeholder="Paste your chess game PGN here..."
-            rows={14}
-          />
+            <textarea
+              id="pgn"
+              value={pgn}
+              onChange={(event) =>
+                setPgn(event.target.value)
+              }
+              placeholder={`[Event "Live Chess"]
+[Site "Chess.com"]
 
-          <button
-            onClick={handleAnalyze}
-            disabled={loading}
-          >
-            {loading
-              ? "Analyzing..."
-              : "Analyze Game"}
-          </button>
+1. e4 e5 2. Nf3 Nc6 3. Bb5 ...`}
+              rows={15}
+            />
+          </div>
 
           {error && (
             <div className="error">
               {error}
             </div>
           )}
+
+          <button
+            className="analyze-button"
+            onClick={handleAnalyze}
+            disabled={loading}
+          >
+            {loading ? "Analyzing..." : "Analyze Game"}
+          </button>
         </section>
 
+        {/* =================================================
+            Results
+            ================================================= */}
         {result && (
           <section className="results">
-            <div className="card">
-              <h2>Analysis</h2>
+            {/* Game summary */}
+            <div className="results-header">
+              <div>
+                <div className="eyebrow">
+                  ANALYSIS COMPLETE
+                </div>
 
-              {result.game && (
-                <div className="game-info">
-                  <strong>
-                    {result.game.white || "White"}
-                  </strong>
-                  {" vs "}
-                  <strong>
-                    {result.game.black || "Black"}
-                  </strong>
+                <h2>Coach Notes</h2>
 
-                  {result.game.result && (
-                    <span>
-                      {" "}({result.game.result})
-                    </span>
+                <p>
+                  {formatPlayerName(
+                    result.game?.white,
+                    "White"
+                  )}{" "}
+                  vs{" "}
+                  {formatPlayerName(
+                    result.game?.black,
+                    "Black"
                   )}
-                </div>
-              )}
+                </p>
+              </div>
 
-              <div className="stats">
-                <div>
-                  <strong>
-                    {result.anomaly_count ?? 0}
-                  </strong>
-                  <span>
-                    Verified anomalies
-                  </span>
-                </div>
+              <button
+                className="download-button"
+                onClick={downloadAnnotatedPgn}
+                disabled={!annotatedPgn}
+              >
+                Download Annotated PGN
+              </button>
+            </div>
 
-                <div>
-                  <strong>
-                    {result.annotations?.length ?? 0}
-                  </strong>
-                  <span>
-                    Coaching annotations
-                  </span>
-                </div>
+            {/* =================================================
+                Stats
+                ================================================= */}
+            <div className="stats-grid">
+              <div className="stat-card">
+                <span className="stat-label">
+                  Anomalies
+                </span>
+
+                <strong>
+                  {result.anomaly_count ?? 0}
+                </strong>
+              </div>
+
+              <div className="stat-card">
+                <span className="stat-label">
+                  Screened
+                </span>
+
+                <strong>
+                  {result.preliminary_candidate_count ??
+                    0}
+                </strong>
+              </div>
+
+              <div className="stat-card">
+                <span className="stat-label">
+                  Verified
+                </span>
+
+                <strong>
+                  {result.verified_candidate_count ??
+                    0}
+                </strong>
+              </div>
+
+              <div className="stat-card">
+                <span className="stat-label">
+                  Result
+                </span>
+
+                <strong>
+                  {result.game?.result || "—"}
+                </strong>
               </div>
             </div>
 
-            <div className="card">
-              <h2>Coach</h2>
-
+            {/* =================================================
+                Annotation cards
+                ================================================= */}
+            <div className="annotations">
               {result.annotations &&
               result.annotations.length > 0 ? (
-                <div className="annotation-list">
-                  {result.annotations.map(
-                    (item) => (
+                result.annotations.map(
+                  (item, index) => {
+                    const moveNumber =
+                      item.move_number ??
+                      Math.ceil(item.ply / 2);
+
+                    return (
                       <article
-                        className="annotation"
-                        key={item.ply}
+                        className="annotation-card"
+                        key={`${item.ply}-${index}`}
                       >
-                        <div className="annotation-header">
-                          <strong>
+                        <div className="move-number">
+                          {moveNumber}
+                          {item.player === "Black"
+                            ? "..."
+                            : "."}
+                        </div>
+
+                        <div className="annotation-content">
+                          <div className="move-name">
                             {item.move}
-                          </strong>
+                          </div>
 
-                          <span>
-                            Ply {item.ply}
-                          </span>
+                          <p>
+                            {item.annotation}
+                          </p>
                         </div>
-
-                        <div className="labels">
-                          {item.stockfish_classification && (
-                            <span className="label">
-                              {
-                                item.stockfish_classification
-                              }
-                            </span>
-                          )}
-
-                          {item.maia_classification && (
-                            <span className="label">
-                              {
-                                item.maia_classification
-                              }
-                            </span>
-                          )}
-                        </div>
-
-                        <p>
-                          {item.annotation}
-                        </p>
                       </article>
-                    )
-                  )}
-                </div>
+                    );
+                  }
+                )
               ) : (
-                <p>
-                  No coaching annotations were
-                  returned.
-                </p>
+                <div className="empty-state">
+                  No significant anomalies were detected
+                  in this game.
+                </div>
               )}
             </div>
 
-            {result.anomaly_count >
-              (result.annotations?.length ?? 0) && (
-              <div className="notice">
-                Some detected anomalies did not
-                receive coaching text.
+            {/* =================================================
+                Download section
+                ================================================= */}
+            {annotatedPgn && (
+              <div className="download-panel">
+                <div>
+                  <h3>
+                    Annotated PGN ready
+                  </h3>
+
+                  <p>
+                    Your coaching comments have been
+                    inserted directly into the PGN.
+                  </p>
+                </div>
+
+                <button
+                  className="download-button"
+                  onClick={downloadAnnotatedPgn}
+                >
+                  Download annotated_game.pgn
+                </button>
               </div>
             )}
           </section>

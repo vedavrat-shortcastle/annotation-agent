@@ -1,5 +1,7 @@
+from __future__ import annotations
+from src.pgn_annotator import generate_annotated_pgn
 import sys
-import re
+import time
 
 from src.pgn_parser import parse_pgn_text
 from src.stockfish import StockfishEngine
@@ -11,14 +13,16 @@ from src.annotation import generate_annotations_batch
 # Configuration
 # =========================================================
 
+# Phase 1 speed optimization
 STOCKFISH_SCREEN_DEPTH = 10
 STOCKFISH_SCREEN_MULTIPV = 2
 
 STOCKFISH_DEEP_DEPTH = 16
 STOCKFISH_DEEP_MULTIPV = 2
 
-MAIA_MULTIPV = 5
+MAIA_MULTIPV = 3
 
+# Chess.com-style thresholds
 INACCURACY_THRESHOLD = 0.30
 MISTAKE_THRESHOLD = 0.80
 BLUNDER_THRESHOLD = 1.50
@@ -26,6 +30,7 @@ BLUNDER_THRESHOLD = 1.50
 GREAT_MOVE_GAP = 0.75
 BRILLIANT_MOVE_GAP = 1.50
 
+# Maia anomaly detection
 MAIA_TOP_K = 5
 
 
@@ -34,11 +39,20 @@ MAIA_TOP_K = 5
 # =========================================================
 
 def find_played_move_uci(move_data):
+    """Return the UCI move played in the PGN."""
     return move_data["uci"]
 
 
 def get_move_player(move_data):
-    player = str(move_data.get("player", "")).strip().lower()
+    """
+    Normalize the player/side field from the PGN parser.
+
+    Returns:
+        "White" or "Black"
+    """
+    player = str(
+        move_data.get("player", "")
+    ).strip().lower()
 
     if player in {"white", "w"}:
         return "White"
@@ -57,7 +71,14 @@ def configure_maia_for_move(
     player_elo,
     opponent_elo,
 ):
-    side = get_move_player(move_data)
+    """
+    Configure Maia so self/opponent Elo corresponds
+    to the side that made this move.
+    """
+
+    side = get_move_player(
+        move_data
+    )
 
     if side == "White":
         self_elo = player_elo
@@ -65,6 +86,10 @@ def configure_maia_for_move(
     else:
         self_elo = opponent_elo
         oppo_elo = player_elo
+
+    maia.elo = self_elo
+    maia.self_elo = self_elo
+    maia.oppo_elo = oppo_elo
 
     maia.configure(
         elo=self_elo,
@@ -74,38 +99,35 @@ def configure_maia_for_move(
 
 
 def get_gap_to_second(top_moves):
+    """
+    Return the evaluation gap between Stockfish's best
+    and second-best moves.
+    """
+
     if len(top_moves) < 2:
         return 0.0
 
-    best_eval = top_moves[0].get("evaluation")
-    second_eval = top_moves[1].get("evaluation")
-
-    if best_eval is None or second_eval is None:
-        return 0.0
-
-    return abs(best_eval - second_eval)
-
-
-def get_played_evaluation(
-    stockfish,
-    fen,
-    played_uci,
-    top_moves,
-):
-    for candidate in top_moves:
-        if candidate.get("uci") == played_uci:
-            return candidate.get("evaluation")
-
-    exact = stockfish.evaluate_specific_move(
-        fen,
-        played_uci,
+    best_eval = top_moves[0].get(
+        "evaluation"
     )
 
-    return exact.get("evaluation")
+    second_eval = top_moves[1].get(
+        "evaluation"
+    )
+
+    if (
+        best_eval is None
+        or second_eval is None
+    ):
+        return 0.0
+
+    return abs(
+        best_eval - second_eval
+    )
 
 
 # =========================================================
-# Classifiers
+# Stockfish classification
 # =========================================================
 
 def classify_stockfish(
@@ -114,6 +136,19 @@ def classify_stockfish(
     best_move,
     gap_to_second,
 ):
+    """
+    Classify the move from objective evaluation.
+
+    Bad moves:
+        inaccuracy >= 0.30
+        mistake    >= 0.80
+        blunder    >= 1.50
+
+    Exceptional moves:
+        great      = best move and gap >= 0.75
+        brilliant  = best move and gap >= 1.50
+    """
+
     if eval_loss >= BLUNDER_THRESHOLD:
         return "blunder"
 
@@ -123,7 +158,11 @@ def classify_stockfish(
     if eval_loss >= INACCURACY_THRESHOLD:
         return "inaccuracy"
 
-    if played_uci == best_move:
+    is_best_move = (
+        played_uci == best_move
+    )
+
+    if is_best_move:
         if gap_to_second >= BRILLIANT_MOVE_GAP:
             return "brilliant"
 
@@ -133,8 +172,23 @@ def classify_stockfish(
     return None
 
 
-def classify_maia(played_uci, maia_result):
-    top_moves = maia_result.get("top_moves", [])
+# =========================================================
+# Maia classification
+# =========================================================
+
+def classify_maia(
+    played_uci,
+    maia_result,
+):
+    """
+    Determine whether the played move is unusual
+    for the configured human Elo.
+    """
+
+    top_moves = maia_result.get(
+        "top_moves",
+        [],
+    )
 
     if not top_moves:
         return {
@@ -146,7 +200,9 @@ def classify_maia(played_uci, maia_result):
 
     for candidate in top_moves:
         if candidate.get("uci") == played_uci:
-            played_rank = candidate.get("rank")
+            played_rank = candidate.get(
+                "rank"
+            )
             break
 
     if played_rank is None:
@@ -174,38 +230,91 @@ def classify_maia(played_uci, maia_result):
 
 
 # =========================================================
-# Stockfish analysis
+# Stockfish screening
 # =========================================================
 
-def analyze_stockfish_move(
+def screen_move(
     move_data,
     stockfish,
 ):
-    fen_before = move_data["fen_before"]
-    played_uci = find_played_move_uci(move_data)
+    """
+    Cheap Stockfish pass.
 
-    position = stockfish.evaluate_position(fen_before)
+    Uses depth 10 / MultiPV 2.
 
-    top_moves = position.get("top_moves", [])
-    best_move = position.get("best_move")
-    best_eval = position.get("best_evaluation")
+    A move becomes a preliminary candidate when:
+      - Stockfish finds an objective anomaly, OR
+      - the move is the best move with a large gap to #2.
 
-    played_eval = get_played_evaluation(
-        stockfish=stockfish,
-        fen=fen_before,
-        played_uci=played_uci,
-        top_moves=top_moves,
+    This pass intentionally does NOT run deep analysis.
+    """
+
+    fen_before = move_data[
+        "fen_before"
+    ]
+
+    played_uci = find_played_move_uci(
+        move_data
     )
+
+    position_result = (
+        stockfish.evaluate_position(
+            fen_before
+        )
+    )
+
+    top_moves = position_result.get(
+        "top_moves",
+        [],
+    )
+
+    best_move = position_result.get(
+        "best_move"
+    )
+
+    best_eval = position_result.get(
+        "best_evaluation"
+    )
+
+    played_eval = None
+
+    # First try to obtain the played move
+    # directly from the MultiPV result.
+    for candidate in top_moves:
+        if candidate.get("uci") == played_uci:
+            played_eval = candidate.get(
+                "evaluation"
+            )
+            break
+
+    # If it wasn't in the top 2, evaluate
+    # that specific move at the cheap depth.
+    if played_eval is None:
+        played_result = (
+            stockfish.evaluate_specific_move(
+                fen_before,
+                played_uci,
+            )
+        )
+
+        played_eval = played_result.get(
+            "evaluation"
+        )
 
     eval_loss = 0.0
 
-    if best_eval is not None and played_eval is not None:
+    if (
+        best_eval is not None
+        and played_eval is not None
+    ):
         eval_loss = max(
             0.0,
             best_eval - played_eval,
         )
 
-    gap_to_second = get_gap_to_second(top_moves)
+    gap_to_second = get_gap_to_second(
+        top_moves
+    )
 
     classification = classify_stockfish(
         eval_loss=eval_loss,
@@ -215,26 +324,140 @@ def analyze_stockfish_move(
     )
 
     return {
-        "classification": classification,
-        "best_move": best_move,
-        "best_evaluation": best_eval,
-        "played_evaluation": played_eval,
-        "evaluation_loss": eval_loss,
-        "gap_to_second": gap_to_second,
-        "top_moves": top_moves,
+        "move": move_data,
+        "played_uci": played_uci,
+        "stockfish": {
+            "classification": classification,
+            "best_move": best_move,
+            "best_evaluation": best_eval,
+            "played_evaluation": played_eval,
+            "evaluation_loss": eval_loss,
+            "gap_to_second": gap_to_second,
+            "top_moves": top_moves,
+        },
     }
 
 
+def is_preliminary_candidate(
+    screen_result,
+):
+    """
+    Decide whether a move deserves expensive
+    deep Stockfish verification.
+    """
+
+    stockfish = (
+        screen_result["stockfish"]
+    )
+
+    classification = stockfish.get(
+        "classification"
+    )
+
+    return classification is not None
+
+
 # =========================================================
-# Maia analysis
+# Deep verification
 # =========================================================
 
-def analyze_maia_move(
-    move_data,
+def verify_candidate(
+    screen_result,
+    deep_stockfish,
     maia,
     player_elo,
     opponent_elo,
 ):
+    """
+    Deeply verify a preliminary Stockfish candidate
+    and then run Maia.
+
+    Maia remains available for every preliminary
+    candidate, preserving the anomaly logic.
+    """
+
+    move_data = screen_result[
+        "move"
+    ]
+
+    fen_before = move_data[
+        "fen_before"
+    ]
+
+    played_uci = find_played_move_uci(
+        move_data
+    )
+
+    # -------------------------------------------------------
+    # Deep Stockfish
+    # -------------------------------------------------------
+
+    deep_result = (
+        deep_stockfish.evaluate_position(
+            fen_before
+        )
+    )
+
+    top_moves = deep_result.get(
+        "top_moves",
+        [],
+    )
+
+    best_move = deep_result.get(
+        "best_move"
+    )
+
+    best_eval = deep_result.get(
+        "best_evaluation"
+    )
+
+    played_eval = None
+
+    for candidate in top_moves:
+        if candidate.get("uci") == played_uci:
+            played_eval = candidate.get(
+                "evaluation"
+            )
+            break
+
+    if played_eval is None:
+        played_result = (
+            deep_stockfish.evaluate_specific_move(
+                fen_before,
+                played_uci,
+            )
+        )
+
+        played_eval = played_result.get(
+            "evaluation"
+        )
+
+    eval_loss = 0.0
+
+    if (
+        best_eval is not None
+        and played_eval is not None
+    ):
+        eval_loss = max(
+            0.0,
+            best_eval - played_eval,
+        )
+
+    gap_to_second = get_gap_to_second(
+        top_moves
+    )
+
+    stockfish_label = classify_stockfish(
+        eval_loss=eval_loss,
+        played_uci=played_uci,
+        best_move=best_move,
+        gap_to_second=gap_to_second,
+    )
+
+    # -------------------------------------------------------
+    # Maia
+    # -------------------------------------------------------
+
     configure_maia_for_move(
         maia=maia,
         move_data=move_data,
@@ -243,103 +466,84 @@ def analyze_maia_move(
     )
 
     maia_result = maia.analyze(
-        move_data["fen_before"]
+        fen_before
     )
 
-    classification = classify_maia(
-        played_uci=find_played_move_uci(move_data),
-        maia_result=maia_result,
+    maia_classification = classify_maia(
+        played_uci,
+        maia_result,
     )
 
-    return {
-        "classification": classification["label"],
-        "rank": classification["rank"],
-        "best_move": maia_result.get("best_move"),
-        "top_moves": maia_result.get("top_moves", []),
-        "elo": maia_result.get("elo"),
-        "self_elo": maia_result.get("self_elo"),
-        "oppo_elo": maia_result.get("oppo_elo"),
-    }
+    maia_label = maia_classification[
+        "label"
+    ]
 
-
-# =========================================================
-# Preliminary screening
-# =========================================================
-
-def screen_move(
-    move_data,
-    stockfish,
-    maia,
-    player_elo,
-    opponent_elo,
-):
-    stockfish_result = analyze_stockfish_move(
-        move_data,
-        stockfish,
-    )
-
-    maia_result = analyze_maia_move(
-        move_data=move_data,
-        maia=maia,
-        player_elo=player_elo,
-        opponent_elo=opponent_elo,
-    )
+    # -------------------------------------------------------
+    # Combined anomaly decision
+    # -------------------------------------------------------
 
     stockfish_anomaly = (
-        stockfish_result["classification"] is not None
+        stockfish_label is not None
     )
 
     maia_anomaly = (
-        maia_result["classification"] == "unexpected"
+        maia_label == "unexpected"
+    )
+
+    should_annotate = (
+        stockfish_anomaly
+        or maia_anomaly
     )
 
     return {
         "move": move_data,
-        "played_uci": move_data["uci"],
-        "stockfish": stockfish_result,
-        "maia": maia_result,
-        "stockfish_anomaly": stockfish_anomaly,
+        "played_uci": played_uci,
+
+        "stockfish": {
+            "classification": stockfish_label,
+            "best_move": best_move,
+            "best_evaluation": best_eval,
+            "played_evaluation": played_eval,
+            "evaluation_loss": eval_loss,
+            "gap_to_second": gap_to_second,
+            "top_moves": top_moves,
+        },
+
+        "maia": {
+            "classification": maia_label,
+            "rank": maia_classification[
+                "rank"
+            ],
+            "best_move": maia_result.get(
+                "best_move"
+            ),
+            "top_moves": maia_result.get(
+                "top_moves",
+                [],
+            ),
+            "elo": maia_result.get(
+                "elo"
+            ),
+            "self_elo": maia_result.get(
+                "self_elo"
+            ),
+            "oppo_elo": maia_result.get(
+                "oppo_elo"
+            ),
+        },
+
+        "stockfish_anomaly": (
+            stockfish_anomaly
+        ),
         "maia_anomaly": maia_anomaly,
         "should_annotate": (
-            stockfish_anomaly or maia_anomaly
+            should_annotate
         ),
     }
 
 
 # =========================================================
-# Deep verification
-# =========================================================
-
-def verify_stockfish_candidate(
-    candidate,
-    deep_stockfish,
-):
-    move_data = candidate["move"]
-
-    deep_stockfish_result = analyze_stockfish_move(
-        move_data=move_data,
-        stockfish=deep_stockfish,
-    )
-
-    final_stockfish_anomaly = (
-        deep_stockfish_result["classification"] is not None
-    )
-
-    final_maia_anomaly = candidate["maia_anomaly"]
-
-    candidate["stockfish"] = deep_stockfish_result
-    candidate["stockfish_anomaly"] = final_stockfish_anomaly
-    candidate["maia_anomaly"] = final_maia_anomaly
-    candidate["should_annotate"] = (
-        final_stockfish_anomaly
-        or final_maia_anomaly
-    )
-
-    return candidate
-
-
-# =========================================================
-# Gemini input
+# Annotation input
 # =========================================================
 
 def build_annotation_input(
@@ -347,63 +551,79 @@ def build_annotation_input(
     player_elo,
     opponent_elo,
 ):
+    """
+    Build the stable structure consumed by
+    src.annotation.generate_annotations_batch().
+    """
+
     move_data = candidate["move"]
 
-    anomaly_reasons = []
-
-    if candidate["stockfish_anomaly"]:
-        label = candidate["stockfish"]["classification"]
-
-        if label:
-            anomaly_reasons.append(
-                f"Stockfish: {label}"
-            )
-
-    if candidate["maia_anomaly"]:
-        anomaly_reasons.append("human-unusual")
-
     return {
-        "fen": move_data["fen_before"],
-        "fen_before": move_data["fen_before"],
-        "fen_after": move_data.get("fen_after"),
-        "move": move_data["move"],
-        "uci": move_data["uci"],
-        "ply": move_data["ply"],
-        "move_number": move_data["move_number"],
-        "player": move_data["player"],
+        "fen": move_data.get("fen"),
+        "fen_before": move_data.get(
+            "fen_before"
+        ),
+        "fen_after": move_data.get(
+            "fen_after"
+        ),
+
+        "played_move": (
+            move_data.get("played_move")
+            or move_data.get("move")
+        ),
+
+        "move": move_data.get(
+            "move"
+        ),
+
+        "uci": move_data.get(
+            "uci"
+        ),
+
+        "ply": move_data.get(
+            "ply"
+        ),
+
+        "move_number": move_data.get(
+            "move_number"
+        ),
+
+        "player": move_data.get(
+            "player"
+        ),
+
         "player_elo": player_elo,
+
         "opponent_elo": opponent_elo,
-        "anomaly_reasons": anomaly_reasons,
-        "stockfish": candidate["stockfish"],
-        "maia": candidate["maia"],
-        "stockfish_anomaly": candidate["stockfish_anomaly"],
-        "maia_anomaly": candidate["maia_anomaly"],
+
+        "anomaly_reasons": [],
+
+        "stockfish": candidate[
+            "stockfish"
+        ],
+
+        "maia": candidate[
+            "maia"
+        ],
+
+        "stockfish_anomaly": candidate[
+            "stockfish_anomaly"
+        ],
+
+        "maia_anomaly": candidate[
+            "maia_anomaly"
+        ],
+
+        "stockfish_classification":
+            candidate["stockfish"][
+                "classification"
+            ],
+
+        "maia_classification":
+            candidate["maia"][
+                "classification"
+            ],
     }
-
-
-# =========================================================
-# PGN header extraction
-# =========================================================
-
-def extract_pgn_headers(pgn_text):
-    headers = {}
-
-    for line in pgn_text.splitlines():
-        line = line.strip()
-
-        if not line.startswith("[") or not line.endswith("]"):
-            continue
-
-        match = re.match(
-            r'^\[([^\s]+)\s+"(.*)"\]$',
-            line,
-        )
-
-        if match:
-            key, value = match.groups()
-            headers[key] = value
-
-    return headers
 
 
 # =========================================================
@@ -416,15 +636,66 @@ def analyze_game(
     opponent_elo,
     progress_callback=None,
 ):
+    """
+    Phase 1 optimized game pipeline:
+
+        PGN
+         ↓
+        Stockfish screening
+         ↓
+        Preliminary candidates
+         ↓
+        Deep Stockfish verification
+         ↓
+        Maia analysis
+         ↓
+        Final anomaly candidates
+         ↓
+        OpenAI annotations
+         ↓
+        Annotated PGN
+    """
+
+    total_start = time.perf_counter()
+
+    # =========================================================
+    # Parse PGN
+    # =========================================================
+
     game = parse_pgn_text(pgn_text)
-    headers = extract_pgn_headers(pgn_text)
+
+    moves = game["moves"]
+
+    # Support either "headers" or legacy "metadata"
+    headers = game.get(
+        "headers",
+        game.get("metadata", {}),
+    )
+
+    if not moves:
+        return {
+            "game": {
+                "white": headers.get("White"),
+                "black": headers.get("Black"),
+                "result": headers.get("Result"),
+            },
+            "annotations": [],
+            "annotated_pgn": pgn_text,
+            "anomaly_count": 0,
+            "preliminary_candidate_count": 0,
+            "verified_candidate_count": 0,
+        }
 
     preliminary_candidates = []
+    candidates = []
+
+    # =========================================================
+    # Phase 1A: Cheap Stockfish screening
+    # =========================================================
+
+    screen_start = time.perf_counter()
 
     screen_stockfish = None
-    screen_maia = None
-
-    total_moves = len(game["moves"])
 
     try:
         screen_stockfish = StockfishEngine(
@@ -432,95 +703,160 @@ def analyze_game(
             multipv=STOCKFISH_SCREEN_MULTIPV,
         )
 
-        screen_maia = MaiaEngine(
-            model="maia3-79m",
-            elo=player_elo,
-            self_elo=player_elo,
-            oppo_elo=opponent_elo,
-            multipv=MAIA_MULTIPV,
+        print(
+            f"\nScreening {len(moves)} moves "
+            "with Stockfish..."
         )
 
         for index, move_data in enumerate(
-            game["moves"],
+            moves,
             start=1,
         ):
-            result = screen_move(
+            screen_result = screen_move(
                 move_data=move_data,
                 stockfish=screen_stockfish,
-                maia=screen_maia,
-                player_elo=player_elo,
-                opponent_elo=opponent_elo,
             )
 
-            if result["should_annotate"]:
-                preliminary_candidates.append(result)
+            if is_preliminary_candidate(
+                screen_result
+            ):
+                preliminary_candidates.append(
+                    screen_result
+                )
 
-            if progress_callback:
+            if progress_callback is not None:
                 progress_callback(
                     index,
-                    total_moves,
+                    len(moves),
                 )
 
     finally:
         if screen_stockfish is not None:
             screen_stockfish.close()
 
-        if screen_maia is not None:
-            screen_maia.close()
-
-    print(
-        f"\nScreening produced "
-        f"{len(preliminary_candidates)} "
-        f"preliminary candidates."
+    screen_time = (
+        time.perf_counter()
+        - screen_start
     )
 
-    # -------------------------------------------------------
-    # Deep verification
-    # -------------------------------------------------------
+    print(
+        f"\nStockfish screening time: "
+        f"{screen_time:.2f}s"
+    )
 
-    verified_candidates = []
+    print(
+        f"Screening produced "
+        f"{len(preliminary_candidates)} "
+        "preliminary candidates."
+    )
 
-    if preliminary_candidates:
+    # =========================================================
+    # Phase 1B: Deep Stockfish + Maia
+    # =========================================================
+
+    deep_start = time.perf_counter()
+
+    deep_stockfish = None
+    maia = None
+
+    try:
+        # -----------------------------------------------------
+        # Start deep Stockfish
+        # -----------------------------------------------------
+
         deep_stockfish = StockfishEngine(
             depth=STOCKFISH_DEEP_DEPTH,
             multipv=STOCKFISH_DEEP_MULTIPV,
         )
 
-        try:
-            total_candidates = len(
-                preliminary_candidates
+        # -----------------------------------------------------
+        # Start Maia only if candidates exist
+        # -----------------------------------------------------
+
+        if preliminary_candidates:
+            maia = MaiaEngine(
+                model="maia3-79m",
+                elo=player_elo,
+                self_elo=player_elo,
+                oppo_elo=opponent_elo,
+                multipv=MAIA_MULTIPV,
             )
 
-            for index, candidate in enumerate(
-                preliminary_candidates,
-                start=1,
-            ):
-                verified = verify_stockfish_candidate(
-                    candidate=candidate,
+        # -----------------------------------------------------
+        # Deep verification
+        # -----------------------------------------------------
+
+        if preliminary_candidates:
+            print(
+                f"\nDeep verification of "
+                f"{len(preliminary_candidates)} "
+                "preliminary candidates..."
+            )
+
+        for index, screen_result in enumerate(
+            preliminary_candidates,
+            start=1,
+        ):
+            print(
+                f"\nDeep verification "
+                f"{index}/"
+                f"{len(preliminary_candidates)}..."
+            )
+
+            try:
+                verified = verify_candidate(
+                    screen_result=screen_result,
                     deep_stockfish=deep_stockfish,
+                    maia=maia,
+                    player_elo=player_elo,
+                    opponent_elo=opponent_elo,
                 )
 
-                if verified["should_annotate"]:
-                    verified_candidates.append(verified)
+            except Exception as exc:
+                move_data = screen_result["move"]
 
                 print(
-                    f"Deep verification "
-                    f"{index}/{total_candidates}..."
+                    f"Deep verification failed for "
+                    f"ply {move_data.get('ply')}: "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
-        finally:
+                continue
+
+            if verified["should_annotate"]:
+                candidates.append(
+                    verified
+                )
+
+    finally:
+        if deep_stockfish is not None:
             deep_stockfish.close()
 
-    candidates = verified_candidates
+        if maia is not None:
+            maia.close()
+
+    deep_time = (
+        time.perf_counter()
+        - deep_start
+    )
+
+    print(
+        f"\nDeep verification + Maia time: "
+        f"{deep_time:.2f}s"
+    )
+
+    # =========================================================
+    # Final candidates
+    # =========================================================
 
     print(
         f"\nVerified "
         f"{len(candidates)} "
-        f"final anomaly candidates."
+        "final anomaly candidates."
     )
 
     if candidates:
-        print("\nCandidates:\n")
+        print("\nCandidates:")
 
         for index, candidate in enumerate(
             candidates,
@@ -528,35 +864,20 @@ def analyze_game(
         ):
             move_data = candidate["move"]
 
-            reasons = []
-
-            if candidate["stockfish_anomaly"]:
-                label = candidate["stockfish"].get(
-                    "classification"
-                )
-
-                if label:
-                    reasons.append(
-                        f"Stockfish: {label}"
-                    )
-
-            if candidate["maia_anomaly"]:
-                reasons.append("human-unusual")
-
-            reason_text = ", ".join(reasons)
-
             print(
                 f"  {index}. "
                 f"{move_data['move']} "
-                f"(ply {move_data['ply']})"
-                f" - {reason_text}"
+                f"(ply {move_data['ply']}) "
+                f"- Stockfish: "
+                f"{candidate['stockfish']['classification']}"
             )
 
-    # -------------------------------------------------------
-    # Gemini annotations — ONE request
-    # -------------------------------------------------------
+    # =========================================================
+    # Phase 2: OpenAI annotations
+    # =========================================================
 
     annotations = []
+    annotations_by_ply = {}
 
     if candidates:
         annotation_inputs = [
@@ -569,56 +890,109 @@ def analyze_game(
         ]
 
         print(
-            f"\nGenerating {len(annotation_inputs)} coaching "
-            "annotations in one Gemini request..."
+            f"\nGenerating "
+            f"{len(annotation_inputs)} "
+            "coaching annotations "
+            "with OpenAI..."
         )
 
         try:
-            annotations_by_ply = generate_annotations_batch(
-                annotation_inputs
+            annotations_by_ply = (
+                generate_annotations_batch(
+                    annotation_inputs
+                )
             )
 
         except Exception as exc:
-            message = str(exc)
+            print(
+                f"\nOpenAI annotation generation "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
 
-            if (
-                "429" in message
-                or "quota" in message.lower()
-                or "rate limit" in message.lower()
-            ):
-                print(
-                    "\nGemini quota/rate limit reached. "
-                    "No batch annotations were generated in this run."
-                )
-                annotations_by_ply = {}
-            else:
-                raise
+            annotations_by_ply = {}
 
         for candidate in candidates:
             move_data = candidate["move"]
             ply = move_data["ply"]
 
-            annotation = annotations_by_ply.get(ply)
+            annotation = annotations_by_ply.get(
+                ply
+            )
 
             if not annotation:
                 continue
 
             annotations.append({
                 "ply": ply,
-                "move_number": move_data["move_number"],
-                "player": move_data["player"],
-                "move": move_data["move"],
+
+                "move_number":
+                    move_data["move_number"],
+
+                "player":
+                    move_data["player"],
+
+                "move":
+                    move_data["move"],
+
                 "stockfish_classification":
-                    candidate["stockfish"]["classification"],
+                    candidate[
+                        "stockfish"
+                    ][
+                        "classification"
+                    ],
+
                 "maia_classification":
-                    candidate["maia"]["classification"],
-                "annotation": annotation,
+                    candidate[
+                        "maia"
+                    ][
+                        "classification"
+                    ],
+
+                "annotation":
+                    annotation,
             })
 
         print(
-            f"Gemini generated {len(annotations)} of "
-            f"{len(candidates)} annotations in 1 request."
+            f"OpenAI generated "
+            f"{len(annotations)} of "
+            f"{len(candidates)} "
+            "annotations."
         )
+
+    # =========================================================
+    # Phase 3: Generate annotated PGN
+    # =========================================================
+
+    print(
+        "\nGenerating annotated PGN..."
+    )
+
+    annotated_pgn = generate_annotated_pgn(
+        pgn_text=pgn_text,
+        annotations_by_ply=annotations_by_ply,
+    )
+
+    print(
+        "Annotated PGN generated."
+    )
+
+    # =========================================================
+    # Total time
+    # =========================================================
+
+    total_time = (
+        time.perf_counter()
+        - total_start
+    )
+
+    print(
+        f"\nTotal analysis time: "
+        f"{total_time:.2f}s"
+    )
+
+    # =========================================================
+    # Final API response
+    # =========================================================
 
     return {
         "game": {
@@ -626,32 +1000,45 @@ def analyze_game(
             "black": headers.get("Black"),
             "result": headers.get("Result"),
         },
+
         "annotations": annotations,
+
         "anomaly_count": len(candidates),
-        "preliminary_candidate_count":
-            len(preliminary_candidates),
-        "verified_candidate_count":
-            len(candidates),
+
+        "annotated_pgn": annotated_pgn,
+
+        "preliminary_candidate_count": len(
+            preliminary_candidates
+        ),
+
+        "verified_candidate_count": len(
+            candidates
+        ),
     }
-
-
 # =========================================================
 # CLI
 # =========================================================
 
-def show_progress(current, total):
+def show_progress(
+    current,
+    total,
+):
     if (
         current == 1
         or current == total
         or current % 4 == 0
     ):
         print(
-            f"Scanning {current}/{total} moves..."
+            f"Scanning "
+            f"{current}/{total} moves..."
         )
 
 
 def main():
-    print("Paste the complete PGN.")
+    print(
+        "Paste the complete PGN."
+    )
+
     print(
         "When finished, press Ctrl+D "
         "(macOS) on a new line.\n"
@@ -661,27 +1048,39 @@ def main():
         pgn_text = sys.stdin.read().strip()
 
     except KeyboardInterrupt:
-        print("\nInput cancelled.")
+        print(
+            "\nInput cancelled."
+        )
         return
 
     if not pgn_text:
-        print("No PGN provided.")
+        print(
+            "No PGN provided."
+        )
         return
 
     try:
         player_elo = int(
-            input("\nPlayer Elo: ").strip()
+            input(
+                "\nPlayer Elo: "
+            ).strip()
         )
 
         opponent_elo = int(
-            input("Opponent Elo: ").strip()
+            input(
+                "Opponent Elo: "
+            ).strip()
         )
 
     except ValueError:
-        print("Elo must be an integer.")
+        print(
+            "Elo must be an integer."
+        )
         return
 
-    print("\nAnalyzing game...\n")
+    print(
+        "\nAnalyzing game...\n"
+    )
 
     try:
         result = analyze_game(
@@ -692,26 +1091,48 @@ def main():
         )
 
     except Exception as exc:
-        print(f"\nAnalysis failed: {exc}")
+        print(
+            f"\nAnalysis failed: {exc}"
+        )
         raise
 
-    print("\n========================================")
+    print(
+        "\n========================================"
+    )
     print("COACH")
-    print("========================================\n")
+    print(
+        "========================================\n"
+    )
 
     if not result["annotations"]:
-        if result["verified_candidate_count"] > 0:
+        if (
+            result[
+                "verified_candidate_count"
+            ] > 0
+        ):
             print(
-                "Anomalies were detected, but "
-                "Gemini did not return annotations."
+                "Anomalies were detected, "
+                "but no coaching annotations "
+                "were generated."
             )
         else:
-            print("No significant anomalies detected.")
+            print(
+                "No significant anomalies detected."
+            )
+
         return
 
     for item in result["annotations"]:
-        print(item["move"])
-        print(item["annotation"])
+        print(
+            f"Move "
+            f"{item['move_number']}: "
+            f"{item['move']}"
+        )
+
+        print(
+            item["annotation"]
+        )
+
         print()
 
 
